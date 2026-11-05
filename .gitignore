@@ -1,0 +1,17 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# .NET
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,13 @@
+name = "door-state-worker"
+main = "index.js"
+compatibility_date = "2026-11-05"
+
+# Cloudflare ダッシュボードで作成した KV namespace のIDを記入
+[[kv_namespaces]]
+binding = "DOOR_STATE"
+id = "905f83da07024920924881586590ce7e"
+
+# Wrangler secret を使う場合:
+#   wrangler secret put DOOR_STATE_TOKEN
+# ローカルテスト用に .dev.vars に定義する場合:
+#   DOOR_STATE_TOKEN=your-secret-token

@@ -1,0 +1,2 @@
+# ローカル開発用 (.dev.vars にリネームして使用)
+DOOR_STATE_TOKEN=your-secret-token
