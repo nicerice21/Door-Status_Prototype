@@ -20,7 +20,7 @@ Windows CLI が BLE で受信して Cloudflare Workers へ送信、
 ```
 
 | コンポーネント | 役割 | 技術 |
-|---|---|---|
+| --- | --- | --- |
 | firmware | 開閉状態と開放経過秒数を BLE GATT で公開 | ESP32S3 / Arduino (PlatformIO) |
 | client | BLE で受信し、Worker へ状態を送信 | C# / .NET 10 / WinRT BLE API |
 | worker | 状態を KV に保存し、ステータスページを表示 | Cloudflare Workers / KV |
@@ -35,7 +35,7 @@ Windows CLI が BLE で受信して Cloudflare Workers へ送信、
 ### 配線
 
 | ESP32S3 | リードスイッチ |
-|---|---|
+| --- | --- |
 | GPIO19 | 一端 |
 | GND | もう一端 |
 
@@ -71,7 +71,7 @@ door_state/
 ### ペイロード (5 bytes)
 
 | Offset | Size | 内容 |
-|---|---|---|
+| --- | --- | --- |
 | 0 | 1 byte | state: `0x00` = CLOSED, `0x01` = OPEN |
 | 1-4 | 4 bytes | elapsedSeconds: 開放してからの経過秒数（uint32, little-endian） |
 
@@ -83,7 +83,7 @@ door_state/
 ### 状態値
 
 | 値 | 状態 |
-|---|---|
+| --- | --- |
 | `0x01` (HIGH) | 接点開放（マグネット遠い）= ドア開放 |
 | `0x00` (LOW) | 接点導通（マグネット近い）= ドア閉鎖 |
 
@@ -187,7 +187,7 @@ Worker のルート URL（`/`）をブラウザで開くと、現在のドア状
 ## Worker API
 
 | Method | Path | 説明 |
-|---|---|---|
+| --- | --- | --- |
 | POST | `/api/status` | 状態を保存。Body: `{"state": 0\|1, "elapsed": <秒>}`。`Authorization: Bearer <TOKEN>` が必要 |
 | GET | `/api/status` | 最新状態を JSON で取得。`elapsedSeconds` には現在の経過秒数が入る |
 | GET | `/` | 状態表示用 HTML ページ |
@@ -208,7 +208,7 @@ Worker のルート URL（`/`）をブラウザで開くと、現在のドア状
 ### KV 使用量の最適化
 
 | 工夫 | 効果 |
-|---|---|
+| --- | --- |
 | 経過秒数を `openedAt` から都度計算 | 定期書き込み（ハートビート）が不要。書き込みはドア開閉時のみ |
 | 同一状態の再送をスキップ | 再接続時の無駄な書き込みを防止 |
 | ページは KV を読まない静的シェル | ページ表示自体は KV 読み取りを消費しない |
