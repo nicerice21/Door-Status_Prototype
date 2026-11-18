@@ -25,6 +25,8 @@ class Program
     private static bool _isConnecting = false;
 
     private static CloudflareWorkerClient? _workerClient;
+    private static byte? _lastPostedState;
+    private static DateTime _lastPostedAtUtc = DateTime.MinValue;
     private static BluetoothLEAdvertisementWatcher? _watcher;
     private static CancellationTokenSource? _appCts;
     private static TypedEventHandler<BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementReceivedEventArgs>? _advertisementHandler;
@@ -213,7 +215,7 @@ class Program
 
                 if (readResult.Status == GattCommunicationStatus.Success)
                 {
-                    HandleValue(readResult.Value, "Current");
+                    HandleValue(readResult.Value, "Current", forcePost: true);
                 }
 
                 // Notify を有効化
@@ -299,17 +301,51 @@ class Program
 
     private static void OnCharacteristicValueChanged(GattCharacteristic sender, GattValueChangedEventArgs args)
     {
-        HandleValue(args.CharacteristicValue, "Changed");
+        HandleValue(args.CharacteristicValue, "Changed", forcePost: false);
     }
 
-    private static void HandleValue(IBuffer buffer, string label)
+    private static void HandleValue(IBuffer buffer, string label, bool forcePost)
     {
         var reader = DataReader.FromBuffer(buffer);
-        byte value = reader.ReadByte();
-        string state = value == 0 ? "CLOSED (magnet near)" : "OPEN (magnet away)";
-        Console.WriteLine($"{label}: 0x{value:X2} - {state}");
+        byte state = reader.ReadByte();
 
-        _workerClient?.SendAsync(value);
+        // 5 バイトペイロードなら経過秒数 (uint32 LE) も読み取る。
+        // 旧ファームウェア (1 バイト) もそのまま扱えるようにする。
+        uint elapsed = 0;
+        if (reader.UnconsumedBufferLength >= 4)
+        {
+            elapsed = reader.ReadUInt32();
+        }
+
+        string stateText = state == 0
+            ? "CLOSED (magnet near)"
+            : $"OPEN (magnet away) - {FormatElapsed(elapsed)} elapsed";
+        Console.WriteLine($"{label}: 0x{state:X2} - {stateText}");
+
+        if (_workerClient != null && ShouldPost(state, forcePost))
+        {
+            _lastPostedState = state;
+            _lastPostedAtUtc = DateTime.UtcNow;
+            _workerClient.SendAsync(state, elapsed);
+        }
+    }
+
+    private static string FormatElapsed(uint seconds)
+    {
+        if (seconds < 60) return $"{seconds}s";
+        if (seconds < 3600) return $"{seconds / 60}m{seconds % 60}s";
+        return $"{seconds / 3600}h{(seconds % 3600) / 60}m";
+    }
+
+    /// <summary>
+    /// Worker への送信を間引く。状態変化時は必ず送信し、開放中は 10 秒ごとに送る。
+    /// </summary>
+    private static bool ShouldPost(byte state, bool force)
+    {
+        if (force) return true;
+        if (_lastPostedState != state) return true;
+        if (state == 1 && (DateTime.UtcNow - _lastPostedAtUtc).TotalSeconds >= 10) return true;
+        return false;
     }
 
     private static async Task DisableNotificationsAsync()
@@ -342,6 +378,7 @@ class Program
             _device?.Dispose();
             _device = null;
             _isConnecting = false;
+            _lastPostedState = null;
         }
     }
 
@@ -385,13 +422,13 @@ class CloudflareWorkerClient : IDisposable
         }
     }
 
-    public void SendAsync(byte state)
+    public void SendAsync(byte state, uint elapsed)
     {
         _ = Task.Run(async () =>
         {
             try
             {
-                var payload = new { state };
+                var payload = new { state, elapsed };
                 var response = await _httpClient.PostAsJsonAsync($"{_url}/api/status", payload);
                 if (!response.IsSuccessStatusCode)
                 {
