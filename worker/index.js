@@ -1,12 +1,17 @@
 /**
  * Cloudflare Worker: Door State Receiver & Viewer
  *
- * - POST /api/status  -> KV に最新ステータス（state, elapsed, updatedAt）を保存
+ * - POST /api/status  -> KV に最新ステータスを保存（状態変化時のみ書き込み）
  * - GET  /api/status  -> KV から最新ステータスを JSON で返す
- * - GET  /            -> ステータス表示用 HTML ページ（経過秒数をライブ表示）
+ * - GET  /            -> ステータス表示用 HTML ページ（KV を読まない静的シェル）
  *
  * KV namespace binding: DOOR_STATE
  * 認証: POST 時に Authorization: Bearer <TOKEN> が必要
+ *
+ * KV 使用量の最適化:
+ * - 経過秒数は openedAt から都度計算するため、定期書き込み（ハートビート）は行わない
+ * - 同一状態の再送は書き込みをスキップ
+ * - ページは静的シェルを返し、可視状態のときだけ 60 秒ごとに API を読む
  */
 
 const KV_KEY = 'current';
@@ -27,7 +32,7 @@ export default {
       }
 
       if (url.pathname === '/') {
-        return await handlePage(env);
+        return handlePage();
       }
 
       return new Response('Not Found', { status: 404 });
@@ -55,21 +60,43 @@ async function handlePost(request, env) {
       ? Math.floor(body.elapsed)
       : 0;
 
+  const now = Date.now();
+  const openedAt = body.state === 1 ? now - elapsed * 1000 : null;
+
+  // 同一状態の再送（再接続時など）は書き込まずに既存レコードを返す
+  const existingRaw = await env.DOOR_STATE.get(KV_KEY);
+  if (existingRaw) {
+    const existing = JSON.parse(existingRaw);
+    if (existing.state === body.state) {
+      const sameOpen =
+        body.state === 1 &&
+        typeof existing.openedAt === 'number' &&
+        Math.abs(existing.openedAt - openedAt) < 5000;
+      if (body.state === 0 || sameOpen) {
+        return jsonResponse({
+          ok: true,
+          unchanged: true,
+          record: { ...existing, elapsedSeconds: computeElapsedSeconds(existing) }
+        });
+      }
+    }
+  }
+
   const record = {
     state: body.state,
-    elapsed,
-    updatedAt: new Date().toISOString()
+    openedAt,
+    updatedAt: new Date(now).toISOString()
   };
 
   await env.DOOR_STATE.put(KV_KEY, JSON.stringify(record));
 
-  return jsonResponse({ ok: true, record });
+  return jsonResponse({ ok: true, record: { ...record, elapsedSeconds: computeElapsedSeconds(record) } });
 }
 
 async function handleGet(env) {
   const raw = await env.DOOR_STATE.get(KV_KEY);
   if (!raw) {
-    return jsonResponse({ state: null, elapsed: null, elapsedSeconds: null, updatedAt: null });
+    return jsonResponse({ state: null, openedAt: null, elapsedSeconds: null, updatedAt: null });
   }
 
   const record = JSON.parse(raw);
@@ -80,43 +107,26 @@ async function handleGet(env) {
 }
 
 /**
- * 保存時点の elapsed に、保存からの経過時間を足して現在の経過秒数を求める。
+ * 開放してからの経過秒数を求める。
+ * 新レコードは openedAt、旧レコード（elapsed + updatedAt）にも対応する。
  */
 function computeElapsedSeconds(record) {
   if (!record || record.state !== 1) return 0;
+
+  if (typeof record.openedAt === 'number') {
+    return Math.max(0, Math.floor((Date.now() - record.openedAt) / 1000));
+  }
+
   const base = typeof record.elapsed === 'number' ? record.elapsed : 0;
   const updatedAtMs = record.updatedAt ? new Date(record.updatedAt).getTime() : Date.now();
-  const drift = Math.max(0, Math.floor((Date.now() - updatedAtMs) / 1000));
-  return base + drift;
+  return base + Math.max(0, Math.floor((Date.now() - updatedAtMs) / 1000));
 }
 
-async function handlePage(env) {
-  const raw = await env.DOOR_STATE.get(KV_KEY);
-  const data = raw ? JSON.parse(raw) : { state: null, elapsed: null, updatedAt: null };
-
-  const stateText =
-    data.state === 0 ? 'CLOSED' :
-    data.state === 1 ? 'OPEN' :
-    'UNKNOWN';
-
-  const subText =
-    data.state === 0 ? 'ドアは閉まっています' :
-    data.state === 1 ? 'ドアが開放されています' :
-    'データを受信していません';
-
-  const themeClass =
-    data.state === 1 ? 'open' :
-    data.state === 0 ? 'closed' :
-    'unknown';
-
-  const updatedText = data.updatedAt
-    ? new Date(data.updatedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })
-    : 'No data';
-
-  // ページ読み込み時点の経過秒数をサーバー側で計算し、以降はブラウザ側でカウントアップする
-  const baseElapsed = computeElapsedSeconds(data);
-  const updatedAtMs = data.updatedAt ? new Date(data.updatedAt).getTime() : null;
-
+/**
+ * 静的なページシェルを返す（KV を読まない）。
+ * データはクライアント側で /api/status から取得し、経過秒数はローカルで進める。
+ */
+function handlePage() {
   const html = `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -164,7 +174,6 @@ async function handlePage(env) {
     .elapsed.open { color: #16a34a; }
     .sub { color: #6b7280; font-size: 1rem; margin-bottom: 1.5rem; }
     .time { color: #9ca3af; font-size: 0.875rem; }
-    .stale { color: #f59e0b; font-size: 0.875rem; margin-top: 0.5rem; min-height: 1.1rem; }
     .dot {
       display: inline-block;
       width: 12px;
@@ -180,19 +189,24 @@ async function handlePage(env) {
 <body>
   <div class="card">
     <h1>Door State Monitor</h1>
-    <div class="status ${themeClass}">
-      <span class="dot ${themeClass}"></span>${stateText}
+    <div class="status unknown" id="status">
+      <span class="dot unknown" id="dot"></span><span id="stateText">UNKNOWN</span>
     </div>
-    <div class="elapsed ${themeClass}" id="elapsed"></div>
-    <div class="sub">${subText}</div>
-    <div class="time">最終更新: ${updatedText}</div>
-    <div class="stale" id="stale"></div>
+    <div class="elapsed" id="elapsed"></div>
+    <div class="sub" id="sub">データを受信していません</div>
+    <div class="time" id="time">No data</div>
   </div>
   <script>
-    const state = ${data.state === null ? 'null' : data.state};
-    const updatedAtMs = ${updatedAtMs === null ? 'null' : updatedAtMs};
-    const baseElapsed = ${baseElapsed};
-    const STALE_AFTER_MS = 60000;
+    const POLL_MS = 60000;
+    const stateTextEl = document.getElementById('stateText');
+    const statusEl = document.getElementById('status');
+    const dotEl = document.getElementById('dot');
+    const elapsedEl = document.getElementById('elapsed');
+    const subEl = document.getElementById('sub');
+    const timeEl = document.getElementById('time');
+
+    let record = null;
+    let fetchedAt = 0;
 
     function formatElapsed(sec) {
       if (sec < 60) return sec + ' 秒';
@@ -200,37 +214,64 @@ async function handlePage(env) {
       return Math.floor(sec / 3600) + ' 時間 ' + Math.floor((sec % 3600) / 60) + ' 分';
     }
 
-    function tick() {
-      const elapsedEl = document.getElementById('elapsed');
-      const staleEl = document.getElementById('stale');
+    const LABELS = {
+      1: ['OPEN', 'open', 'ドアが開放されています'],
+      0: ['CLOSED', 'closed', 'ドアは閉まっています']
+    };
 
-      if (state === 1 && updatedAtMs !== null) {
-        const sec = baseElapsed + Math.floor((Date.now() - updatedAtMs) / 1000);
-        elapsedEl.textContent = formatElapsed(Math.max(0, sec)) + ' 経過';
-        staleEl.textContent =
-          Date.now() - updatedAtMs > STALE_AFTER_MS ? '（デバイスからの更新が停止しています）' : '';
-      } else if (state === 0) {
-        elapsedEl.textContent = '';
-        staleEl.textContent =
-          updatedAtMs !== null && Date.now() - updatedAtMs > STALE_AFTER_MS
-            ? '（デバイスからの更新が停止しています）'
-            : '';
+    function render() {
+      const state = record ? record.state : null;
+      const label = LABELS[state] || ['UNKNOWN', 'unknown', 'データを受信していません'];
+      const [, cls, sub] = label;
+
+      stateTextEl.textContent = label[0];
+      statusEl.className = 'status ' + cls;
+      dotEl.className = 'dot ' + cls;
+      elapsedEl.className = 'elapsed ' + cls;
+      subEl.textContent = sub;
+      timeEl.textContent = record && record.updatedAt
+        ? '最終更新: ' + new Date(record.updatedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })
+        : 'No data';
+
+      if (state === 1) {
+        tick();
       } else {
         elapsedEl.textContent = '';
-        staleEl.textContent = '';
       }
     }
 
-    tick();
+    function tick() {
+      if (!record || record.state !== 1) return;
+      const base = typeof record.elapsedSeconds === 'number' ? record.elapsedSeconds : 0;
+      const sec = Math.max(0, base + Math.floor((Date.now() - fetchedAt) / 1000));
+      elapsedEl.textContent = formatElapsed(sec) + ' 経過';
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/api/status', { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        record = await res.json();
+        fetchedAt = Date.now();
+        render();
+      } catch (e) {
+        // 取得に失敗しても直前の表示を維持する
+      }
+    }
+
+    refresh();
     setInterval(tick, 1000);
-    // 1 分ごとにサーバーから最新状態を取得して再同期
-    setInterval(() => location.reload(), 60000);
+    setInterval(() => { if (!document.hidden) refresh(); }, POLL_MS);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
   </script>
 </body>
 </html>`;
 
   return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'public, max-age=60'
+    }
   });
 }
 
@@ -243,7 +284,8 @@ function jsonResponse(body, status = 200) {
     status,
     headers: {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store'
     }
   });
 }

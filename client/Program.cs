@@ -26,7 +26,6 @@ class Program
 
     private static CloudflareWorkerClient? _workerClient;
     private static byte? _lastPostedState;
-    private static DateTime _lastPostedAtUtc = DateTime.MinValue;
     private static BluetoothLEAdvertisementWatcher? _watcher;
     private static CancellationTokenSource? _appCts;
     private static TypedEventHandler<BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementReceivedEventArgs>? _advertisementHandler;
@@ -325,7 +324,6 @@ class Program
         if (_workerClient != null && ShouldPost(state, forcePost))
         {
             _lastPostedState = state;
-            _lastPostedAtUtc = DateTime.UtcNow;
             _workerClient.SendAsync(state, elapsed);
         }
     }
@@ -338,14 +336,12 @@ class Program
     }
 
     /// <summary>
-    /// Worker への送信を間引く。状態変化時は必ず送信し、開放中は 10 秒ごとに送る。
+    /// Worker への送信を間引く。KV 書き込みを抑えるため、状態変化時と接続直後のみ送信する。
+    /// 開放経過秒数は Worker 側で保存時刻から計算するため、定期送信は不要。
     /// </summary>
     private static bool ShouldPost(byte state, bool force)
     {
-        if (force) return true;
-        if (_lastPostedState != state) return true;
-        if (state == 1 && (DateTime.UtcNow - _lastPostedAtUtc).TotalSeconds >= 10) return true;
-        return false;
+        return force || _lastPostedState != state;
     }
 
     private static async Task DisableNotificationsAsync()
