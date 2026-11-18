@@ -2,8 +2,9 @@
 
 学生IoTプロジェクトのプロトタイプ。
 リードスイッチでドアの開閉状態を検知し、ESP32S3 から BLE で通知します。
-Windows CLI が BLE で受信して Cloudflare Workers へ送信し、
-ブラウザから現在のドア状態を確認できます。
+ドアが開放されてからの経過秒数もあわせて通知し、
+Windows CLI が BLE で受信して Cloudflare Workers へ送信、
+ブラウザから現在のドア状態と開放経過時間を確認できます。
 
 ## システム構成
 
@@ -11,7 +12,7 @@ Windows CLI が BLE で受信して Cloudflare Workers へ送信し、
 [リードスイッチ]
       |
       v
-[ESP32S3 DevKitC-1]  -- BLE (GATT/Notify) -->  [Windows CLI (C#)]
+[ESP32S3 DevKitC-1]  -- BLE (state + elapsed) -->  [Windows CLI (C#)]
                                                     |
                                                     | HTTPS POST
                                                     v
@@ -19,8 +20,8 @@ Windows CLI が BLE で受信して Cloudflare Workers へ送信し、
 ```
 
 | コンポーネント | 役割 | 技術 |
-|---|---|---|
-| firmware | リードスイッチの状態を BLE GATT サービスで公開 | ESP32S3 / Arduino (PlatformIO) |
+| --- | --- | --- |
+| firmware | 開閉状態と開放経過秒数を BLE GATT で公開 | ESP32S3 / Arduino (PlatformIO) |
 | client | BLE で受信し、Worker へ状態を送信 | C# / .NET 10 / WinRT BLE API |
 | worker | 状態を KV に保存し、ステータスページを表示 | Cloudflare Workers / KV |
 
@@ -34,7 +35,7 @@ Windows CLI が BLE で受信して Cloudflare Workers へ送信し、
 ### 配線
 
 | ESP32S3 | リードスイッチ |
-|---|---|
+| --- | --- |
 | GPIO19 | 一端 |
 | GND | もう一端 |
 
@@ -67,14 +68,27 @@ door_state/
 - Characteristic UUID: `12345678-1234-1234-1234-123456789abd`
 - Properties: Read, Notify
 
+### ペイロード (5 bytes)
+
+| Offset | Size | 内容 |
+| --- | --- | --- |
+| 0 | 1 byte | state: `0x00` = CLOSED, `0x01` = OPEN |
+| 1-4 | 4 bytes | elapsedSeconds: 開放してからの経過秒数（uint32, little-endian） |
+
+- CLOSED のときは `elapsedSeconds = 0` です。
+- ドアが開放されるとタイマーが開始し、**開放中は 1 秒ごと**に通知されます。
+- 状態が変化したときは即座に通知されます。
+- 接続直後にも現在値が通知されます。
+
 ### 状態値
 
 | 値 | 状態 |
-|---|---|
-| `0x01` (HIGH) | 接点開放（マグネット遠い） |
-| `0x00` (LOW) | 接点導通（マグネット近い） |
+| --- | --- |
+| `0x01` (HIGH) | 接点開放（マグネット遠い）= ドア開放 |
+| `0x00` (LOW) | 接点導通（マグネット近い）= ドア閉鎖 |
 
 ※内部プルアップのため、接点開放時は HIGH、導通時は LOW になります。
+※後方互換のため、CLI は 1 バイトのみ（旧ファームウェア）の通知も受け付けます。
 
 ## セットアップ
 
@@ -116,10 +130,15 @@ dotnet run
 ```
 Scanning...
 Found: ESP32S3-ReedSwitch [XXXXXXXXXXXX]
-Current: 0x01 - OPEN (magnet away)
+Connecting... (attempt 1/3)
+Current: 0x01 - OPEN (magnet away) - 0s elapsed
 Notifications enabled.
+Changed: 0x01 - OPEN (magnet away) - 1s elapsed
+Changed: 0x01 - OPEN (magnet away) - 2s elapsed
 Changed: 0x00 - CLOSED (magnet near)
 ```
+
+Worker への送信は**状態変化時と接続直後のみ**行います。開放経過秒数は Worker 側で保存時刻から計算するため、毎秒・定期の送信は不要です（KV 書き込みの削減）。
 
 > **注意**: Windows で初めて BLE デバイスに接続する場合、ペアリングや Bluetooth アクセス許可が必要になることがあります。接続が失敗する場合は、Windows の「Bluetooth とその他のデバイス」設定から ESP32S3 をペアリングしてみてください。
 
@@ -162,21 +181,47 @@ dotnet run
 dotnet run -- --worker=https://door-state-worker.<subdomain>.workers.dev --token=your-secret-token
 ```
 
-Worker のルート URL（`/`）をブラウザで開くと、現在のドア状態が表示されます（5 秒ごと自動更新）。
+Worker のルート URL（`/`）をブラウザで開くと、現在のドア状態と開放経過時間が表示されます。
+ページは静的シェルで、表示中のみ 60 秒ごとに `/api/status` を取得し、経過時間はブラウザ側で毎秒カウントアップします（タブが非表示の間はポーリングしません）。
 
 ## Worker API
 
 | Method | Path | 説明 |
-|---|---|---|
-| POST | `/api/status` | 状態を保存。Body: `{"state": 0\|1}`。`Authorization: Bearer <TOKEN>` が必要 |
-| GET | `/api/status` | 最新状態を JSON で取得 |
+| --- | --- | --- |
+| POST | `/api/status` | 状態を保存。Body: `{"state": 0\|1, "elapsed": <秒>}`。`Authorization: Bearer <TOKEN>` が必要 |
+| GET | `/api/status` | 最新状態を JSON で取得。`elapsedSeconds` には現在の経過秒数が入る |
 | GET | `/` | 状態表示用 HTML ページ |
+
+### 保存されるレコード
+
+```json
+{
+  "state": 1,
+  "openedAt": 1763430245000,
+  "updatedAt": "2026-11-18T03:04:05.000Z"
+}
+```
+
+`openedAt` は開放を検知した時刻（epoch ミリ秒、CLI が送った `elapsed` から算出）、`updatedAt` は Worker が保存した時刻です。
+`GET /api/status` は保存レコードに加えて、`openedAt` から計算した現在の `elapsedSeconds` を返します。
+
+### KV 使用量の最適化
+
+| 工夫 | 効果 |
+| --- | --- |
+| 経過秒数を `openedAt` から都度計算 | 定期書き込み（ハートビート）が不要。書き込みはドア開閉時のみ |
+| 同一状態の再送をスキップ | 再接続時の無駄な書き込みを防止 |
+| ページは KV を読まない静的シェル | ページ表示自体は KV 読み取りを消費しない |
+| 可視時のみ 60 秒ポーリング | 裏タブや短時間の再読み込みで読み取りを増やさない |
+
+結果として、KV 書き込みは「1 回の開閉につき最大 2 回」に抑えられます。
 
 ## 動作確認
 
 1. ESP32S3 にファームウェアを書き込み、シリアルモニタで `Ready. Advertising started.` を確認
 2. CLI を起動し、接続・Notify 有効化を確認
 3. マグネットでリードスイッチを ON/OFF し、CLI とブラウザの両方で状態が変わることを確認
+4. ドアを開放したままにし、CLI のログとブラウザの経過秒数が 1 秒ごとに増えることを確認
 
 nRF Connect などの BLE スキャナーでも `ESP32S3-ReedSwitch` の Characteristic 値を直接確認できます。
 
