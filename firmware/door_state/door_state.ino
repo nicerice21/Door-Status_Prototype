@@ -29,6 +29,9 @@ bool doorOpen = false;
 unsigned long openedAt = 0;
 unsigned long lastNotifyTime = 0;
 
+// Arduino IDE の自動プロトタイプ生成がクラス内呼び出しに効かないため明示的に宣言
+void publishState();
+
 class MyServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer *server) {
       deviceConnected = true;
